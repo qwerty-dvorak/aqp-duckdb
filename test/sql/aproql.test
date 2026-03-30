@@ -1,0 +1,23 @@
+# name: test/sql/aproql.test
+# description: test aproql extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT aproql('Sam');
+----
+Catalog Error: Scalar Function with name aproql does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require aproql
+
+# Confirm the extension works
+query I
+SELECT aproql('Sam');
+----
+Aproql Sam 🐥
+
+query I
+SELECT aproql_openssl_version('Michael') ILIKE 'Aproql Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
