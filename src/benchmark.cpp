@@ -7,6 +7,13 @@
 #include <vector>
 #include <cmath>
 #include <sstream>
+#include <algorithm>
+#include <fstream>
+
+// Number of timed iterations per query (median is taken)
+static constexpr int NUM_ITERATIONS = 5;
+// Number of warmup runs before timing
+static constexpr int NUM_WARMUP = 2;
 
 struct BenchmarkQuery {
 	std::string label;
@@ -41,7 +48,6 @@ static double extract_numeric_value(duckdb::unique_ptr<duckdb::MaterializedQuery
 	if (val.IsNull()) {
 		return 0.0;
 	}
-	// Try to get as double, fallback to int64
 	try {
 		return val.GetValue<double>();
 	} catch (...) {
@@ -53,13 +59,63 @@ static double extract_numeric_value(duckdb::unique_ptr<duckdb::MaterializedQuery
 	}
 }
 
+// Run a query multiple times and return the median execution time in ms.
+// Also returns the result value from the last successful read.
+static double timed_query_median(duckdb::Connection &conn, const std::string &sql,
+                                 double &out_value, int iterations = NUM_ITERATIONS,
+                                 int warmup = NUM_WARMUP) {
+	// Warmup runs — not timed
+	for (int i = 0; i < warmup; i++) {
+		auto res = conn.Query(sql);
+		(void)res;
+	}
+
+	std::vector<double> times;
+	times.reserve(iterations);
+	double last_val = 0.0;
+
+	for (int i = 0; i < iterations; i++) {
+		auto start = std::chrono::high_resolution_clock::now();
+		auto res = conn.Query(sql);
+		auto end = std::chrono::high_resolution_clock::now();
+		double ms = std::chrono::duration<double, std::milli>(end - start).count();
+		times.push_back(ms);
+		last_val = extract_numeric_value(res);
+	}
+
+	std::sort(times.begin(), times.end());
+	out_value = last_val;
+	return times[iterations / 2];
+}
+
+// Holds info about one sample file created each run
+struct SampleCreationInfo {
+	std::string label;
+	std::string parquet_path;
+	std::string query_source;       // actual SQL fragment used in approx queries
+	double create_parquet_ms = 0.0; // time to write the parquet (-1 = reused)
+	double create_table_ms  = 0.0;  // time to load into in-memory table (0 = not loaded)
+	int64_t rows = 0;
+	double actual_pct = 0.0;
+	bool ok = false;                // false = unusable, abort
+};
+
 static void print_query_result(const BenchmarkResult &r) {
 	std::cout << "============================================================" << std::endl;
 	std::cout << "Query : " << r.label << std::endl;
 	std::cout << "------------------------------------------------------------" << std::endl;
 	std::cout << std::fixed << std::setprecision(1);
-	std::cout << "  Approx Time    : " << std::setw(7) << r.approx_time_ms << " ms   (~10% of dataset scanned)"
-	          << std::endl;
+
+	std::string approx_note = "(sampled)";
+	if (r.algorithm.find("5%") != std::string::npos) {
+		approx_note = "(~5% of dataset scanned)";
+	} else if (r.algorithm.find("10%") != std::string::npos) {
+		approx_note = "(~10% of dataset scanned)";
+	} else if (r.algorithm.find("HLL") != std::string::npos) {
+		approx_note = "(HyperLogLog sketch)";
+	}
+
+	std::cout << "  Approx Time    : " << std::setw(7) << r.approx_time_ms << " ms   " << approx_note << std::endl;
 	std::cout << "  Exact Time     : " << std::setw(7) << r.exact_time_ms << " ms   (100% — full scan)" << std::endl;
 	std::cout << "  Speedup        : " << std::setw(6) << r.speedup << "x" << std::endl;
 	std::cout << std::setprecision(2);
@@ -141,6 +197,34 @@ static void print_summary_table(const std::vector<BenchmarkResult> &results) {
 	std::cout << "Average Error % : " << avg_error << "%" << std::endl;
 }
 
+static void print_sample_creation_summary(const std::vector<SampleCreationInfo> &infos) {
+	std::cout << std::endl;
+	std::cout << "Sample File Creation Times" << std::endl;
+	std::cout << "┌─────────────────┬─────────────────┬─────────────────┬──────────────────────┐" << std::endl;
+	std::cout << "│ Sample          │ Write Parquet   │ Load to Table   │ Rows                 │" << std::endl;
+	std::cout << "│                 │ (ms)            │ (ms)            │                      │" << std::endl;
+	std::cout << "├─────────────────┼─────────────────┼─────────────────┼──────────────────────┤" << std::endl;
+	for (const auto &info : infos) {
+		std::ostringstream pq_ss, tbl_ss, rows_ss;
+		if (info.create_parquet_ms < 0.0) {
+			pq_ss << "reused";
+		} else {
+			pq_ss << std::fixed << std::setprecision(1) << info.create_parquet_ms;
+		}
+		if (info.create_table_ms == 0.0 && info.rows == 0) {
+			tbl_ss << "parquet direct";
+		} else {
+			tbl_ss << std::fixed << std::setprecision(1) << info.create_table_ms;
+		}
+		rows_ss << info.rows << " (" << std::fixed << std::setprecision(1) << info.actual_pct << "%)";
+		std::cout << "│ " << pad_right(info.label, 15)
+		          << " │" << center(pq_ss.str(), 17)
+		          << "│" << center(tbl_ss.str(), 17)
+		          << "│" << center(rows_ss.str(), 22) << "│" << std::endl;
+	}
+	std::cout << "└─────────────────┴─────────────────┴─────────────────┴──────────────────────┘" << std::endl;
+}
+
 int main() {
 	std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
 	std::cout << "  aproql Benchmark Runner | e6data Hackathon" << std::endl;
@@ -148,8 +232,10 @@ int main() {
 	std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
 	std::cout << std::endl;
 
-	// Create in-memory database
-	duckdb::DuckDB db(nullptr);
+	// Single-threaded: ensures speedup reflects row-count reduction, not parallelism
+	duckdb::DBConfig config;
+	config.SetOptionByName("threads", duckdb::Value::INTEGER(1));
+	duckdb::DuckDB db(nullptr, &config);
 	duckdb::Connection conn(db);
 
 	// Load extension
@@ -157,57 +243,189 @@ int main() {
 	auto load_result = conn.Query("LOAD 'build/release/extension/aproql/aproql.duckdb_extension'");
 	if (load_result->HasError()) {
 		std::cerr << "[!] Failed to load extension: " << load_result->GetError() << std::endl;
-		std::cerr << "[*] Continuing without extension (HLL function will not be available)..." << std::endl;
+		std::cerr << "[*] Continuing without extension (HLL function unavailable)..." << std::endl;
 	} else {
 		std::cout << "[+] Extension loaded successfully." << std::endl;
 	}
 
-	// Register ClickBench dataset
+	// Load full dataset into memory
 	std::cout << "[*] Loading ClickBench dataset from data/hits.parquet..." << std::endl;
-	auto view_result = conn.Query("CREATE TABLE hits AS SELECT * FROM read_parquet('data/hits.parquet')");
-	if (view_result->HasError()) {
-		std::cerr << "[!] Failed to create view: " << view_result->GetError() << std::endl;
-		std::cerr << "[!] Make sure data/hits.parquet exists." << std::endl;
+	conn.Query("DROP TABLE IF EXISTS hits");
+	auto table_result = conn.Query("CREATE TABLE hits AS SELECT * FROM read_parquet('data/hits.parquet')");
+	if (table_result->HasError()) {
+		std::cerr << "[!] Failed to load dataset: " << table_result->GetError() << std::endl;
 		return 1;
 	}
-	std::cout << "[+] Dataset loaded." << std::endl;
+	std::cout << "[+] Dataset loaded into memory." << std::endl;
 
-	// Get row count
-	auto count_result = conn.Query("SELECT COUNT(*) FROM hits");
-	if (!count_result->HasError()) {
-		auto chunk = count_result->Fetch();
-		if (chunk && chunk->size() > 0) {
-			std::cout << "[+] Total rows: " << chunk->GetValue(0, 0).ToString() << std::endl;
+	int64_t total_rows = 0;
+	{
+		auto cr = conn.Query("SELECT COUNT(*) FROM hits");
+		if (!cr->HasError()) {
+			auto chunk = cr->Fetch();
+			if (chunk && chunk->size() > 0) {
+				total_rows = chunk->GetValue(0, 0).GetValue<int64_t>();
+				std::cout << "[+] Total rows: " << total_rows << std::endl;
+			}
 		}
 	}
 
-	// Load pre-built sample tables from parquet files (much faster than creating at runtime)
-	std::cout << "[*] Loading pre-built sample tables..." << std::endl;
-	conn.Query("CREATE TABLE hits_5pct AS SELECT * FROM 'data/hits_5pct.parquet'");
-	conn.Query("CREATE TABLE hits_10pct AS SELECT * FROM 'data/hits_10pct.parquet'");
-	std::cout << "[+] Sample tables loaded (5%, 10%)." << std::endl;
+	// -----------------------------------------------------------------------
+	// Create sample parquet files and load them into in-memory tables.
+	// Strategy (handles disk-full gracefully):
+	//   1. COPY … TABLESAMPLE to parquet  → time it (or reuse existing file)
+	//   2. CREATE TABLE … AS SELECT * FROM read_parquet(…) → time it
+	//   3. If step 2 fails (disk full for temp space), fall back to querying
+	//      the parquet file directly without a table — still valid and fast.
+	// -----------------------------------------------------------------------
+	std::cout << "[*] Creating sample files and loading tables..." << std::endl;
+
+	std::vector<SampleCreationInfo> sample_infos;
+
+	auto create_sample = [&](const char* label, int pct, const char* parquet_path,
+	                          const char* table_name) -> SampleCreationInfo {
+		SampleCreationInfo info;
+		info.label = label;
+		info.parquet_path = parquet_path;
+
+		// --- Step 1: Write parquet file (timed) ---
+		std::string export_sql =
+		    std::string("COPY (SELECT * FROM hits TABLESAMPLE ") + std::to_string(pct) +
+		    " PERCENT (system)) TO '" + parquet_path + "' (FORMAT PARQUET)";
+		auto t0 = std::chrono::high_resolution_clock::now();
+		auto export_res = conn.Query(export_sql);
+		auto t1 = std::chrono::high_resolution_clock::now();
+		info.create_parquet_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+		if (export_res->HasError()) {
+			// Try to reuse existing parquet from a prior run
+			std::ifstream f(parquet_path);
+			if (f.good()) {
+				std::cerr << "[!] Could not re-write " << parquet_path
+				          << " (disk full?). Using existing file." << std::endl;
+				info.create_parquet_ms = -1.0;  // sentinel: reused
+			} else {
+				std::cerr << "[!] Failed to write " << parquet_path << ": "
+				          << export_res->GetError() << std::endl;
+				info.ok = false;
+				return info;  // nothing we can do
+			}
+		} else {
+			std::cout << std::fixed << std::setprecision(1)
+			          << "[+] Wrote " << parquet_path
+			          << " in " << info.create_parquet_ms << " ms" << std::endl;
+		}
+
+		// --- Step 2: Load parquet into in-memory table (timed) ---
+		conn.Query(std::string("DROP TABLE IF EXISTS ") + table_name);
+		std::string load_sql =
+		    std::string("CREATE TABLE ") + table_name +
+		    " AS SELECT * FROM read_parquet('" + parquet_path + "')";
+		auto t2 = std::chrono::high_resolution_clock::now();
+		auto load_res = conn.Query(load_sql);
+		auto t3 = std::chrono::high_resolution_clock::now();
+		info.create_table_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+		if (load_res->HasError()) {
+			// Disk too full for in-memory table — fall back to direct parquet queries
+			std::cerr << "[!] Could not load " << table_name
+			          << " into memory (disk full?). Will query parquet directly." << std::endl;
+			// Use read_parquet(...) as the query source instead of the table name
+			info.query_source = std::string("read_parquet('") + parquet_path + "')";
+			// Get row count from the parquet file directly
+			auto cnt = conn.Query(std::string("SELECT COUNT(*) FROM '") + parquet_path + "'");
+			if (!cnt->HasError()) {
+				auto chunk = cnt->Fetch();
+				if (chunk && chunk->size() > 0)
+					info.rows = chunk->GetValue(0, 0).GetValue<int64_t>();
+			}
+		} else {
+			std::cout << "[+] Loaded " << table_name
+			          << " in " << std::fixed << std::setprecision(1)
+			          << info.create_table_ms << " ms" << std::endl;
+			info.query_source = table_name;  // in-memory table — preferred
+			// Row count from the in-memory table
+			auto cnt = conn.Query(std::string("SELECT COUNT(*) FROM ") + table_name);
+			if (!cnt->HasError()) {
+				auto chunk = cnt->Fetch();
+				if (chunk && chunk->size() > 0)
+					info.rows = chunk->GetValue(0, 0).GetValue<int64_t>();
+			}
+		}
+
+		info.actual_pct = total_rows > 0 ? (100.0 * info.rows / total_rows) : 0.0;
+		std::cout << "[+] " << label << " rows: " << info.rows
+		          << " (" << std::fixed << std::setprecision(1) << info.actual_pct << "%)"
+		          << " — querying from: " << info.query_source << std::endl;
+		info.ok = (info.rows > 0);
+		return info;
+	};
+
+	auto s5  = create_sample("5% sample",  5,  "data/hits_5pct.parquet",  "hits_sample_5pct");
+	auto s10 = create_sample("10% sample", 10, "data/hits_10pct.parquet", "hits_sample_10pct");
+	sample_infos.push_back(s5);
+	sample_infos.push_back(s10);
+
+	if (!s5.ok || !s10.ok) {
+		std::cerr << "[!] Sample data is unavailable. Cannot run benchmark." << std::endl;
+		return 1;
+	}
+
+	// Compute real scale factors from actual sample row counts
+	double scale_5pct  = s5.rows  > 0 ? static_cast<double>(total_rows) / static_cast<double>(s5.rows)  : 1.0;
+	double scale_10pct = s10.rows > 0 ? static_cast<double>(total_rows) / static_cast<double>(s10.rows) : 1.0;
+
+	std::cout << "[+] Scale factors — 5%: " << std::fixed << std::setprecision(2) << scale_5pct
+	          << "  10%: " << scale_10pct << std::endl;
 	std::cout << std::endl;
 
-	// Define benchmark queries
-	// Exact queries read from PARQUET FILE (cold storage) - simulates real workload
-	// Approx queries use pre-built sample tables (hot) + scale factor
-	// HLL runs on FULL parquet for best accuracy (not sampled)
+	// Build scale factor strings and query source references
+	std::ostringstream sf5_ss, sf10_ss;
+	sf5_ss  << std::fixed << std::setprecision(6) << scale_5pct;
+	sf10_ss << std::fixed << std::setprecision(6) << scale_10pct;
+	const std::string sf5    = sf5_ss.str();
+	const std::string src5   = s5.query_source;   // table name or read_parquet(...)
+	const std::string src10  = s10.query_source;
+
+	// Build benchmark queries using the correct source (table or parquet)
 	std::vector<BenchmarkQuery> queries = {
-	    {"Avg page load time", "SELECT AVG(SendTiming) FROM 'data/hits.parquet'",
-	     "SELECT AVG(SendTiming) FROM hits_10pct", 1.0},
-	    {"Total hits by OS", "SELECT COUNT(*) FROM 'data/hits.parquet'", "SELECT COUNT(*)*20 FROM hits_5pct", 20.0},
-	    {"Avg age by browser country", "SELECT AVG(Age) FROM 'data/hits.parquet'", "SELECT AVG(Age) FROM hits_5pct",
+	    {"Avg page load time",
+	     "SELECT AVG(SendTiming) FROM hits",
+	     "SELECT AVG(SendTiming) FROM " + src10,
 	     1.0},
-	    {"Total param price", "SELECT SUM(ParamPrice) FROM 'data/hits.parquet'",
-	     "SELECT SUM(ParamPrice)*20 FROM hits_5pct", 20.0},
-	    {"Avg resolution width", "SELECT AVG(ResolutionWidth) FROM 'data/hits.parquet'",
-	     "SELECT AVG(ResolutionWidth) FROM hits_5pct", 1.0},
-	    {"Count by social network", "SELECT COUNT(*) FROM 'data/hits.parquet'", "SELECT COUNT(*)*20 FROM hits_5pct",
-	     20.0},
-	    {"Avg connect timing", "SELECT AVG(ConnectTiming) FROM 'data/hits.parquet'",
-	     "SELECT AVG(ConnectTiming) FROM hits_5pct", 1.0},
-	    {"Unique user count (HLL)", "SELECT COUNT(DISTINCT UserID) FROM 'data/hits.parquet'",
-	     "SELECT approx_count_distinct(UserID) FROM 'data/hits.parquet'", 1.0}};
+	    {"Total hits (COUNT)",
+	     "SELECT COUNT(*) FROM hits",
+	     "SELECT CAST(COUNT(*) * " + sf5 + " AS BIGINT) FROM " + src5,
+	     scale_5pct},
+	    {"Avg age",
+	     "SELECT AVG(Age) FROM hits",
+	     "SELECT AVG(Age) FROM " + src5,
+	     1.0},
+	    {"Total param price (SUM)",
+	     "SELECT SUM(ParamPrice) FROM hits",
+	     "SELECT SUM(ParamPrice) * " + sf5 + " FROM " + src5,
+	     scale_5pct},
+	    {"Avg resolution width",
+	     "SELECT AVG(ResolutionWidth) FROM hits",
+	     "SELECT AVG(ResolutionWidth) FROM " + src5,
+	     1.0},
+	    {"Total event count (COUNT)",
+	     "SELECT COUNT(*) FROM hits",
+	     "SELECT CAST(COUNT(*) * " + sf5 + " AS BIGINT) FROM " + src5,
+	     scale_5pct},
+	    {"Avg connect timing",
+	     "SELECT AVG(ConnectTiming) FROM hits",
+	     "SELECT AVG(ConnectTiming) FROM " + src5,
+	     1.0},
+	    {"Unique user count (HLL)",
+	     "SELECT COUNT(DISTINCT UserID) FROM hits",
+	     "SELECT approx_count_distinct(UserID) FROM hits",
+	     1.0}
+	};
+
+	std::cout << "[*] Running benchmarks (" << NUM_WARMUP << " warmup + "
+	          << NUM_ITERATIONS << " timed iterations per query, median reported)..."
+	          << std::endl << std::endl;
 
 	std::vector<BenchmarkResult> results;
 
@@ -215,30 +433,17 @@ int main() {
 		BenchmarkResult r;
 		r.label = q.label;
 
-		// Time exact SQL
-		auto exact_start = std::chrono::high_resolution_clock::now();
-		auto exact_result = conn.Query(q.exact_sql);
-		auto exact_end = std::chrono::high_resolution_clock::now();
-		r.exact_time_ms = std::chrono::duration<double, std::milli>(exact_end - exact_start).count();
-		r.exact_val = extract_numeric_value(exact_result);
+		r.exact_time_ms  = timed_query_median(conn, q.exact_sql,  r.exact_val);
+		r.approx_time_ms = timed_query_median(conn, q.approx_sql, r.approx_val);
 
-		// Time approximate SQL
-		auto approx_start = std::chrono::high_resolution_clock::now();
-		auto approx_result = conn.Query(q.approx_sql);
-		auto approx_end = std::chrono::high_resolution_clock::now();
-		r.approx_time_ms = std::chrono::duration<double, std::milli>(approx_end - approx_start).count();
-		r.approx_val = extract_numeric_value(approx_result);
-
-		// Compute metrics
-		r.speedup = (r.approx_time_ms > 0) ? round2(r.exact_time_ms / r.approx_time_ms) : 0.0;
-		r.error_pct = round2(get_error_percentage(r.approx_val, r.exact_val));
-		r.accuracy_pct = round2(100.0 - r.error_pct);
+		r.speedup        = (r.approx_time_ms > 0) ? round2(r.exact_time_ms / r.approx_time_ms) : 0.0;
+		r.error_pct      = round2(get_error_percentage(r.approx_val, r.exact_val));
+		r.accuracy_pct   = round2(100.0 - r.error_pct);
 		r.margin_of_error = round2(std::abs(r.approx_val - r.exact_val));
 
-		// Determine algorithm label
 		if (q.label.find("HLL") != std::string::npos) {
-			r.algorithm = "HyperLogLog (full data)";
-		} else if (q.approx_sql.find("hits_5pct") != std::string::npos) {
+			r.algorithm = "HyperLogLog (approx_count_distinct)";
+		} else if (q.approx_sql.find("5pct") != std::string::npos) {
 			r.algorithm = "System Sampling (5%)";
 		} else {
 			r.algorithm = "System Sampling (10%)";
@@ -249,6 +454,7 @@ int main() {
 	}
 
 	print_summary_table(results);
+	print_sample_creation_summary(sample_infos);
 
 	return 0;
 }
