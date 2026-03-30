@@ -17,6 +17,11 @@
 
 class AproqlTDigest {
 public:
+	struct Centroid {
+		double mean;
+		double weight;
+	};
+
 	// compression controls accuracy vs memory: higher → more centroids → better.
 	// 200 gives ~0.5% relative error at the median and <0.1% at the tails.
 	explicit AproqlTDigest(double compression = 200.0)
@@ -76,12 +81,18 @@ public:
 
 		return centroids_.back().mean;
 	}
+	const std::vector<Centroid>& get_centroids() {
+		compress();
+		return centroids_;
+	}
+
+	void merge(AproqlTDigest& other) {
+		for (const auto& c : other.get_centroids()) {
+			add(c.mean, c.weight);
+		}
+	}
 
 private:
-	struct Centroid {
-		double mean;
-		double weight;
-	};
 
 	double compression_;
 	double total_weight_;

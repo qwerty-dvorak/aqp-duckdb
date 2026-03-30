@@ -389,9 +389,9 @@ int main() {
 
 	// Build benchmark queries using the correct source (table or parquet)
 	std::vector<BenchmarkQuery> queries = {
-	    {"Avg page load time",
-	     "SELECT AVG(SendTiming) FROM hits",
-	     "SELECT AVG(SendTiming) FROM " + src10,
+	    {"Avg region ID",
+	     "SELECT AVG(RegionID) FROM hits",
+	     "SELECT AVG(RegionID) FROM " + src10,
 	     1.0},
 	    {"Total hits (COUNT)",
 	     "SELECT COUNT(*) FROM hits",
@@ -413,9 +413,9 @@ int main() {
 	     "SELECT COUNT(*) FROM hits",
 	     "SELECT CAST(COUNT(*) * " + sf5 + " AS BIGINT) FROM " + src5,
 	     scale_5pct},
-	    {"Avg connect timing",
-	     "SELECT AVG(ConnectTiming) FROM hits",
-	     "SELECT AVG(ConnectTiming) FROM " + src10,
+	    {"Avg counter ID",
+	     "SELECT AVG(CounterID) FROM hits",
+	     "SELECT AVG(CounterID) FROM " + src5,
 	     1.0},
 	    {"Unique user count (HLL)",
 	     "SELECT COUNT(DISTINCT UserID) FROM hits",
@@ -424,15 +424,15 @@ int main() {
 	    // --- New sketch-based queries ---
 	    {"Freq of OS=2 (CMS)",
 	     "SELECT COUNT(*) FROM hits WHERE CAST(OS AS VARCHAR) = '2'",
-	     "SELECT CAST(approx_freq_cms(list(CAST(OS AS VARCHAR)), '2') * " + sf5 + " AS BIGINT) FROM " + src5,
+	     "SELECT CAST(approx_freq_cms(CAST(OS AS VARCHAR), '2') * " + sf5 + " AS BIGINT) FROM " + src5,
 	     scale_5pct},
-	    {"Median send timing (T-Dig)",
-	     "SELECT MEDIAN(SendTiming) FROM hits",
-	     "SELECT approx_quantile(SendTiming, 0.5) FROM " + src5,
+	    {"Median counter ID (T-Dig)",
+	     "SELECT MEDIAN(CounterID) FROM hits",
+	     "SELECT approx_quantile(CounterID, 0.5) FROM " + src5,
 	     1.0},
-	    {"P95 send timing (T-Dig)",
-	     "SELECT quantile_cont(SendTiming, 0.95) FROM hits",
-	     "SELECT approx_quantile(SendTiming, 0.95) FROM " + src5,
+	    {"P95 counter ID (T-Dig)",
+	     "SELECT quantile_cont(CounterID, 0.95) FROM hits",
+	     "SELECT approx_quantile(CounterID, 0.95) FROM " + src5,
 	     1.0}
 	};
 

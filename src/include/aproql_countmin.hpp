@@ -43,6 +43,18 @@ public:
 		return min_count;
 	}
 
+	std::string target_val;
+	const std::vector<int64_t>& get_table() const { return table_; }
+	
+	void merge(const AproqlCountMinSketch& other) {
+		for (size_t i = 0; i < table_.size(); i++) {
+			table_[i] += other.get_table()[i];
+		}
+		if (target_val.empty()) {
+			target_val = other.target_val;
+		}
+	}
+
 private:
 	int depth_;
 	int width_;

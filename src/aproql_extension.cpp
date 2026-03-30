@@ -8,7 +8,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/string_type.hpp"
 
 namespace duckdb {
 
@@ -182,124 +184,111 @@ static void ApproxCountDistinctHLLFun(DataChunk &args, ExpressionState &state, V
 }
 
 // ---------------------------------------------------------------------------
-// approx_freq_cms(VARCHAR[], VARCHAR) → BIGINT
-// Builds a Count-Min Sketch from the first argument (list of strings) and
-// returns the estimated frequency of the second argument (target string).
+// approx_freq_cms(VARCHAR, VARCHAR) → BIGINT
+// AggregateFunction using Count-Min Sketch.
 // ---------------------------------------------------------------------------
-static void ApproxFreqCMSFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &list_vec   = args.data[0];
-	auto &target_vec = args.data[1];
-	auto count       = args.size();
+struct CMSAggState {
+	AproqlCountMinSketch *sketch;
+};
 
-	UnifiedVectorFormat list_data;
-	list_vec.ToUnifiedFormat(count, list_data);
-
-	UnifiedVectorFormat target_data;
-	target_vec.ToUnifiedFormat(count, target_data);
-
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data     = FlatVector::GetData<int64_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
-
-	for (idx_t i = 0; i < count; i++) {
-		auto list_idx   = list_data.sel->get_index(i);
-		auto target_idx = target_data.sel->get_index(i);
-
-		// NULL guard: list or target is NULL → result is NULL
-		if (!list_data.validity.RowIsValid(list_idx) ||
-		    !target_data.validity.RowIsValid(target_idx)) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-
-		auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(list_data);
-		auto &entry = list_entries[list_idx];
-		auto &child = ListVector::GetEntry(list_vec);
-
-		// Empty list → NULL
-		if (entry.length == 0) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-
-		// Get the target string
-		auto target_val = target_vec.GetValue(i);
-		std::string target_str = target_val.ToString();
-
-		// Build sketch from the list entries
-		AproqlCountMinSketch cms;
-		for (idx_t j = 0; j < entry.length; j++) {
-			auto child_val = child.GetValue(entry.offset + j);
-			if (!child_val.IsNull()) {
-				cms.add(child_val.ToString());
-			}
-		}
-
-		result_data[i] = cms.estimate(target_str);
+struct CMSAggOP {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.sketch = nullptr;
 	}
-}
 
-// ---------------------------------------------------------------------------
-// approx_quantile_sketch(DOUBLE[], DOUBLE) → DOUBLE
-// Builds a T-Digest from the first argument (list of doubles) and returns
-// the estimated value at the quantile specified by the second argument.
-// ---------------------------------------------------------------------------
-static void ApproxQuantileSketchFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &list_vec = args.data[0];
-	auto &q_vec    = args.data[1];
-	auto count     = args.size();
-
-	UnifiedVectorFormat list_data;
-	list_vec.ToUnifiedFormat(count, list_data);
-
-	UnifiedVectorFormat q_data;
-	q_vec.ToUnifiedFormat(count, q_data);
-
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data     = FlatVector::GetData<double>(result);
-	auto &result_validity = FlatVector::Validity(result);
-
-	for (idx_t i = 0; i < count; i++) {
-		auto list_idx = list_data.sel->get_index(i);
-		auto q_idx    = q_data.sel->get_index(i);
-
-		// NULL guard
-		if (!list_data.validity.RowIsValid(list_idx) ||
-		    !q_data.validity.RowIsValid(q_idx)) {
-			result_validity.SetInvalid(i);
-			continue;
+	template <class A_TYPE, class B_TYPE, class STATE, class OP>
+	static void Operation(STATE &state, A_TYPE val, B_TYPE target, AggregateBinaryInput &) {
+		if (!state.sketch) {
+			state.sketch = new AproqlCountMinSketch();
+			state.sketch->target_val = target.GetString();
 		}
-
-		auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(list_data);
-		auto &entry = list_entries[list_idx];
-		auto &child = ListVector::GetEntry(list_vec);
-
-		// Empty list → NULL
-		if (entry.length == 0) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-
-		double q = UnifiedVectorFormat::GetData<double>(q_data)[q_idx];
-
-		// Quantile must be in [0, 1]
-		if (q < 0.0 || q > 1.0) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-
-		// Build T-Digest from the list entries
-		AproqlTDigest td;
-		for (idx_t j = 0; j < entry.length; j++) {
-			auto child_val = child.GetValue(entry.offset + j);
-			if (!child_val.IsNull()) {
-				td.add(child_val.GetValue<double>());
-			}
-		}
-
-		result_data[i] = td.quantile(q);
+		state.sketch->add(val.GetString());
 	}
-}
+
+	template <class STATE, class OP>
+	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!source.sketch) return;
+		if (!target.sketch) {
+			target.sketch = new AproqlCountMinSketch(*source.sketch);
+			return;
+		}
+		target.sketch->merge(*source.sketch);
+	}
+
+	template <class RESULT_TYPE, class STATE>
+	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
+		if (!state.sketch) {
+			finalize_data.ReturnNull();
+			return;
+		}
+		target = state.sketch->estimate(state.sketch->target_val);
+	}
+
+	template <class STATE>
+	static void Destroy(STATE &state, AggregateInputData &) {
+		if (state.sketch) {
+			delete state.sketch;
+		}
+	}
+
+	static bool IgnoreNull() { return true; }
+};
+
+// ---------------------------------------------------------------------------
+// approx_quantile_sketch(DOUBLE, DOUBLE) → DOUBLE
+// AggregateFunction using T-Digest
+// ---------------------------------------------------------------------------
+struct TDigestAggState {
+	AproqlTDigest *digest;
+	double quantile;
+};
+
+struct TDigestAggOP {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.digest = nullptr;
+		state.quantile = 0.5;
+	}
+
+	template <class A_TYPE, class B_TYPE, class STATE, class OP>
+	static void Operation(STATE &state, A_TYPE val, B_TYPE q, AggregateBinaryInput &) {
+		if (!state.digest) {
+			state.digest = new AproqlTDigest();
+			state.quantile = q;
+		}
+		state.digest->add(val);
+	}
+
+	template <class STATE, class OP>
+	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!source.digest) return;
+		if (!target.digest) {
+			target.digest = new AproqlTDigest(*source.digest);
+			target.quantile = source.quantile;
+			return;
+		}
+		target.digest->merge(*source.digest);
+	}
+
+	template <class RESULT_TYPE, class STATE>
+	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
+		if (!state.digest) {
+			finalize_data.ReturnNull();
+			return;
+		}
+		target = state.digest->quantile(state.quantile);
+	}
+
+	template <class STATE>
+	static void Destroy(STATE &state, AggregateInputData &) {
+		if (state.digest) {
+			delete state.digest;
+		}
+	}
+
+	static bool IgnoreNull() { return true; }
+};
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// approx_avg_list(DOUBLE[], DOUBLE) → DOUBLE
@@ -334,20 +323,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ApproxCountDistinctHLLFun);
 	loader.RegisterFunction(approx_count_distinct_hll);
 
-	// approx_freq_cms(VARCHAR[], VARCHAR) → BIGINT
-	auto approx_freq_cms = ScalarFunction(
-	    "approx_freq_cms",
-	    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
-	    LogicalType::BIGINT,
-	    ApproxFreqCMSFun);
+	// approx_freq_cms(VARCHAR, VARCHAR) → BIGINT
+	auto approx_freq_cms = AggregateFunction::BinaryAggregate<CMSAggState, string_t, string_t, int64_t, CMSAggOP>(
+	    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT);
+	approx_freq_cms.name = "approx_freq_cms";
+	approx_freq_cms.destructor = AggregateFunction::StateDestroy<CMSAggState, CMSAggOP>;
 	loader.RegisterFunction(approx_freq_cms);
 
-	// approx_quantile_sketch(DOUBLE[], DOUBLE) → DOUBLE
-	auto approx_quantile_sketch = ScalarFunction(
-	    "approx_quantile_sketch",
-	    {LogicalType::LIST(LogicalType::DOUBLE), LogicalType::DOUBLE},
-	    LogicalType::DOUBLE,
-	    ApproxQuantileSketchFun);
+	// approx_quantile_sketch(DOUBLE, DOUBLE) → DOUBLE
+	auto approx_quantile_sketch = AggregateFunction::BinaryAggregate<TDigestAggState, double, double, double, TDigestAggOP>(
+	    LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE);
+	approx_quantile_sketch.name = "approx_quantile_sketch";
+	approx_quantile_sketch.destructor = AggregateFunction::StateDestroy<TDigestAggState, TDigestAggOP>;
 	loader.RegisterFunction(approx_quantile_sketch);
 }
 
