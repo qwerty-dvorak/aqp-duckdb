@@ -2,6 +2,8 @@
 
 #include "aproql_extension.hpp"
 #include "aproql_hyperloglog.hpp"
+#include "aproql_countmin.hpp"
+#include "aproql_tdigest.hpp"
 #include "algorithms.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -179,6 +181,126 @@ static void ApproxCountDistinctHLLFun(DataChunk &args, ExpressionState &state, V
 	}
 }
 
+// ---------------------------------------------------------------------------
+// approx_freq_cms(VARCHAR[], VARCHAR) → BIGINT
+// Builds a Count-Min Sketch from the first argument (list of strings) and
+// returns the estimated frequency of the second argument (target string).
+// ---------------------------------------------------------------------------
+static void ApproxFreqCMSFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &list_vec   = args.data[0];
+	auto &target_vec = args.data[1];
+	auto count       = args.size();
+
+	UnifiedVectorFormat list_data;
+	list_vec.ToUnifiedFormat(count, list_data);
+
+	UnifiedVectorFormat target_data;
+	target_vec.ToUnifiedFormat(count, target_data);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data     = FlatVector::GetData<int64_t>(result);
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto list_idx   = list_data.sel->get_index(i);
+		auto target_idx = target_data.sel->get_index(i);
+
+		// NULL guard: list or target is NULL → result is NULL
+		if (!list_data.validity.RowIsValid(list_idx) ||
+		    !target_data.validity.RowIsValid(target_idx)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+
+		auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(list_data);
+		auto &entry = list_entries[list_idx];
+		auto &child = ListVector::GetEntry(list_vec);
+
+		// Empty list → NULL
+		if (entry.length == 0) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+
+		// Get the target string
+		auto target_val = target_vec.GetValue(i);
+		std::string target_str = target_val.ToString();
+
+		// Build sketch from the list entries
+		AproqlCountMinSketch cms;
+		for (idx_t j = 0; j < entry.length; j++) {
+			auto child_val = child.GetValue(entry.offset + j);
+			if (!child_val.IsNull()) {
+				cms.add(child_val.ToString());
+			}
+		}
+
+		result_data[i] = cms.estimate(target_str);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// approx_quantile_sketch(DOUBLE[], DOUBLE) → DOUBLE
+// Builds a T-Digest from the first argument (list of doubles) and returns
+// the estimated value at the quantile specified by the second argument.
+// ---------------------------------------------------------------------------
+static void ApproxQuantileSketchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &list_vec = args.data[0];
+	auto &q_vec    = args.data[1];
+	auto count     = args.size();
+
+	UnifiedVectorFormat list_data;
+	list_vec.ToUnifiedFormat(count, list_data);
+
+	UnifiedVectorFormat q_data;
+	q_vec.ToUnifiedFormat(count, q_data);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data     = FlatVector::GetData<double>(result);
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto list_idx = list_data.sel->get_index(i);
+		auto q_idx    = q_data.sel->get_index(i);
+
+		// NULL guard
+		if (!list_data.validity.RowIsValid(list_idx) ||
+		    !q_data.validity.RowIsValid(q_idx)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+
+		auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(list_data);
+		auto &entry = list_entries[list_idx];
+		auto &child = ListVector::GetEntry(list_vec);
+
+		// Empty list → NULL
+		if (entry.length == 0) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+
+		double q = UnifiedVectorFormat::GetData<double>(q_data)[q_idx];
+
+		// Quantile must be in [0, 1]
+		if (q < 0.0 || q > 1.0) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+
+		// Build T-Digest from the list entries
+		AproqlTDigest td;
+		for (idx_t j = 0; j < entry.length; j++) {
+			auto child_val = child.GetValue(entry.offset + j);
+			if (!child_val.IsNull()) {
+				td.add(child_val.GetValue<double>());
+			}
+		}
+
+		result_data[i] = td.quantile(q);
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// approx_avg_list(DOUBLE[], DOUBLE) → DOUBLE
 	auto approx_avg_list = ScalarFunction(
@@ -211,6 +333,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    LogicalType::BIGINT,
 	    ApproxCountDistinctHLLFun);
 	loader.RegisterFunction(approx_count_distinct_hll);
+
+	// approx_freq_cms(VARCHAR[], VARCHAR) → BIGINT
+	auto approx_freq_cms = ScalarFunction(
+	    "approx_freq_cms",
+	    {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	    LogicalType::BIGINT,
+	    ApproxFreqCMSFun);
+	loader.RegisterFunction(approx_freq_cms);
+
+	// approx_quantile_sketch(DOUBLE[], DOUBLE) → DOUBLE
+	auto approx_quantile_sketch = ScalarFunction(
+	    "approx_quantile_sketch",
+	    {LogicalType::LIST(LogicalType::DOUBLE), LogicalType::DOUBLE},
+	    LogicalType::DOUBLE,
+	    ApproxQuantileSketchFun);
+	loader.RegisterFunction(approx_quantile_sketch);
 }
 
 void AproqlExtension::Load(ExtensionLoader &loader) {

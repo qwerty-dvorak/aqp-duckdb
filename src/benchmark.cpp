@@ -401,9 +401,9 @@ int main() {
 	     "SELECT AVG(Age) FROM hits",
 	     "SELECT AVG(Age) FROM " + src5,
 	     1.0},
-	    {"Total param price (SUM)",
-	     "SELECT SUM(ParamPrice) FROM hits",
-	     "SELECT SUM(ParamPrice) * " + sf5 + " FROM " + src5,
+	    {"Total resolution width (SUM)",
+	     "SELECT SUM(ResolutionWidth) FROM hits",
+	     "SELECT SUM(ResolutionWidth) * " + sf5 + " FROM " + src5,
 	     scale_5pct},
 	    {"Avg resolution width",
 	     "SELECT AVG(ResolutionWidth) FROM hits",
@@ -415,11 +415,24 @@ int main() {
 	     scale_5pct},
 	    {"Avg connect timing",
 	     "SELECT AVG(ConnectTiming) FROM hits",
-	     "SELECT AVG(ConnectTiming) FROM " + src5,
+	     "SELECT AVG(ConnectTiming) FROM " + src10,
 	     1.0},
 	    {"Unique user count (HLL)",
 	     "SELECT COUNT(DISTINCT UserID) FROM hits",
 	     "SELECT approx_count_distinct(UserID) FROM hits",
+	     1.0},
+	    // --- New sketch-based queries ---
+	    {"Freq of OS=2 (CMS)",
+	     "SELECT COUNT(*) FROM hits WHERE CAST(OS AS VARCHAR) = '2'",
+	     "SELECT CAST(approx_freq_cms(list(CAST(OS AS VARCHAR)), '2') * " + sf5 + " AS BIGINT) FROM " + src5,
+	     scale_5pct},
+	    {"Median send timing (T-Dig)",
+	     "SELECT MEDIAN(SendTiming) FROM hits",
+	     "SELECT approx_quantile(SendTiming, 0.5) FROM " + src5,
+	     1.0},
+	    {"P95 send timing (T-Dig)",
+	     "SELECT quantile_cont(SendTiming, 0.95) FROM hits",
+	     "SELECT approx_quantile(SendTiming, 0.95) FROM " + src5,
 	     1.0}
 	};
 
@@ -443,6 +456,10 @@ int main() {
 
 		if (q.label.find("HLL") != std::string::npos) {
 			r.algorithm = "HyperLogLog (approx_count_distinct)";
+		} else if (q.label.find("CMS") != std::string::npos) {
+			r.algorithm = "Count-Min Sketch";
+		} else if (q.label.find("T-Dig") != std::string::npos) {
+			r.algorithm = "T-Digest";
 		} else if (q.approx_sql.find("5pct") != std::string::npos) {
 			r.algorithm = "System Sampling (5%)";
 		} else {
