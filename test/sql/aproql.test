@@ -2,22 +2,29 @@
 # description: test aproql extension
 # group: [sql]
 
-# Before we load the extension, this will fail
-statement error
-SELECT aproql('Sam');
-----
-Catalog Error: Scalar Function with name aproql does not exist!
-
 # Require statement will ensure this test is run with this extension loaded
 require aproql
 
-# Confirm the extension works
+# Test approx_avg_list
 query I
-SELECT aproql('Sam');
+SELECT approx_avg_list([1.0, 2.0, 3.0, 4.0, 5.0], 0.10);
 ----
-Aproql Sam 🐥
+3.0
 
+# Test approx_sum_list
 query I
-SELECT aproql_openssl_version('Michael') ILIKE 'Aproql Michael, my linked OpenSSL version is OpenSSL%';
+SELECT approx_sum_list([100.0, 200.0, 300.0], 0.10);
+----
+6000.0
+
+# Test approx_count_list
+query I
+SELECT approx_count_list([1.0, 2.0, 3.0], 0.10);
+----
+30
+
+# Test approx_count_distinct_hll — HLL is approximate, so we check a reasonable range
+query I
+SELECT approx_count_distinct_hll(['a', 'b', 'c', 'a', 'b']) BETWEEN 2 AND 4;
 ----
 true
