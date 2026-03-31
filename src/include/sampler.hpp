@@ -2,7 +2,7 @@
 
 #include <string>
 #include <vector>
-#include <map>
+#include <unordered_map>
 #include "duckdb.hpp"
 
 struct SampleResult {
@@ -16,7 +16,7 @@ SampleResult reservoir_sample(duckdb::Connection& conn,
                                const std::string& column,
                                double fraction);
 
-std::map<std::string, SampleResult> stratified_sample(duckdb::Connection& conn,
+std::unordered_map<std::string, SampleResult> stratified_sample(duckdb::Connection& conn,
                                                         const std::string& view_name,
                                                         const std::string& value_col,
                                                         const std::string& group_col,

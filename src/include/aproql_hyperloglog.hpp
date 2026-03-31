@@ -70,8 +70,8 @@ public:
     }
 
 private:
-    static const int b = 12;
-    static const int m = 4096;
+    static const int b = 10;
+    static const int m = 1024;
     std::vector<uint8_t> registers;
 
     uint64_t hash64(const std::string& s) const {

@@ -2,6 +2,7 @@
 #include "duckdb.hpp"
 #include <sstream>
 #include <cmath>
+#include <unordered_map>
 
 SampleResult reservoir_sample(duckdb::Connection& conn,
                                const std::string& view_name,
@@ -32,7 +33,7 @@ SampleResult reservoir_sample(duckdb::Connection& conn,
         if (pct < 1) pct = 1;
         std::ostringstream oss;
         oss << "SELECT CAST(" << column << " AS DOUBLE) FROM " << view_name
-            << " USING SAMPLE " << pct << "% (reservoir)";
+            << " USING SAMPLE " << pct << "% (system)";
         auto sample_res = conn.Query(oss.str());
         if (sample_res->HasError()) {
             return result;
@@ -52,19 +53,19 @@ SampleResult reservoir_sample(duckdb::Connection& conn,
     return result;
 }
 
-std::map<std::string, SampleResult> stratified_sample(duckdb::Connection& conn,
+std::unordered_map<std::string, SampleResult> stratified_sample(duckdb::Connection& conn,
                                                         const std::string& view_name,
                                                         const std::string& value_col,
                                                         const std::string& group_col,
                                                         double fraction) {
-    std::map<std::string, SampleResult> results;
+    std::unordered_map<std::string, SampleResult> results;
 
     int pct = static_cast<int>(std::round(fraction * 100.0));
     if (pct < 1) pct = 1;
 
     std::ostringstream oss;
     oss << "SELECT CAST(" << group_col << " AS VARCHAR), CAST(" << value_col << " AS DOUBLE) FROM " << view_name
-        << " USING SAMPLE " << pct << "% (reservoir)";
+        << " USING SAMPLE " << pct << "% (system)";
 
     auto sample_res = conn.Query(oss.str());
     if (sample_res->HasError()) {
@@ -72,7 +73,7 @@ std::map<std::string, SampleResult> stratified_sample(duckdb::Connection& conn,
     }
 
     // Collect into groups
-    std::map<std::string, std::vector<double>> grouped;
+    std::unordered_map<std::string, std::vector<double>> grouped;
     while (true) {
         auto chunk = sample_res->Fetch();
         if (!chunk || chunk->size() == 0) break;
